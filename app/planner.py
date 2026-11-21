@@ -8,9 +8,13 @@
 - 同一卷内按序号升序读取不需要回卷；因此每卷至多回卷 1 次，
   只有“当前已挂载卷”可能被迫回卷（其余卷从卷首开始升序读即可）。
 
-算法：卷数最多 12，枚举所有非空卷子集（至多 4095 个），
-对每个能覆盖全部待取文件的子集计算代价，取代价最小者。
-平局时依次按：装带更少、用卷更少、子集位掩码更小（保证确定性）。
+算法（卷数 V ≤ 12）：
+- 副本索引 ``CopyIndex`` 在作业内复用：文件与卷均用位掩码表示，
+  每卷线性汇总一次“持有副本的文件掩码”；一张回执只更新所涉文件的汇总。
+- 选卷阶段枚举全部非空卷子集（≤ 4095 个），覆盖关系由子集并集的
+  LSB 递推得到；回卷判定用“免回卷并集”的同构递推。
+  汇总为 O(文件数 + 副本数) 的线性工作量，评完全部卷组至多 O(V·2^V)。
+- 平局时依次按：装带更少、用卷更少、子集位掩码更小（保证确定性）。
 """
 from __future__ import annotations
 
@@ -60,39 +64,187 @@ class Plan:
         return None
 
 
-def _choose_volumes(
-    targets: list[str],
-    copies: dict[str, list[Copy]],
-    current_volume: int | None,
-    head: int,
-    volumes: list[int],
-) -> int:
-    """枚举卷子集，返回最优子集的位掩码。"""
-    n = len(volumes)
-    best_key: tuple[int, int, int, int] | None = None
-    best_mask = 0
-    for mask in range(1, 1 << n):
-        selected = {volumes[i] for i in range(n) if mask & (1 << i)}
-        # 覆盖检查：每个待取文件在选定卷中至少有一个可用副本
-        if not all(any(c.volume in selected for c in copies[f]) for f in targets):
-            continue
-        mounts = len(selected) - (1 if current_volume in selected else 0)
-        rewinds = 0
-        if current_volume is not None and current_volume in selected:
-            # 仅当某文件在选定卷中的副本全部落在当前卷且全部低于带头时，
-            # 才被迫回卷（否则总可以把它安排到别的卷或带头之后的副本上）
-            for f in targets:
-                in_sel = [c for c in copies[f] if c.volume in selected]
-                if all(
-                    c.volume == current_volume and c.position < head for c in in_sel
+class CopyIndex:
+    """作业内复用的副本索引：文件/卷位掩码 + 每卷持有的文件掩码。
+
+    - 创建时一次性汇总；后续规划只做位运算，不再逐副本扫描全目录。
+    - ``disable_copy`` / ``mark_done`` 只改动回执所涉单个文件的掩码，
+      其余文件的索引原样复用。
+    """
+
+    def __init__(
+        self,
+        copies_by_file: dict[str, list[Copy]],
+        all_files: list[str] | tuple[str, ...],
+    ) -> None:
+        # 文件位号按 all_files 的顺序分配（作业中即文件清单顺序），保证确定性
+        names: list[str] = list(all_files)
+        seen = set(names)
+        for f in copies_by_file:
+            if f not in seen:
+                names.append(f)
+                seen.add(f)
+        self.names: list[str] = names
+        self.bit_of_file: dict[str, int] = {f: i for i, f in enumerate(names)}
+
+        self.copies_by_file: dict[str, list[Copy]] = {
+            f: list(cs) for f, cs in copies_by_file.items()
+        }
+        self.volumes: list[int] = sorted(
+            {c.volume for cs in self.copies_by_file.values() for c in cs}
+        )
+        # cover[v]：卷 v 上仍有可用副本的文件位掩码
+        self.cover: dict[int, int] = {v: 0 for v in self.volumes}
+        for f, cs in self.copies_by_file.items():
+            file_bit = 1 << self.bit_of_file[f]
+            for v in {c.volume for c in cs}:
+                self.cover[v] |= file_bit
+        # present_mask：至少有一个可用副本的文件；pending_mask：仍待取的文件。
+        # 注意没有任何副本的文件不在 present_mask 中，但仍是待取（无副本可读）文件。
+        self.present_mask: int = 0
+        for mask in self.cover.values():
+            self.present_mask |= mask
+        self.pending_mask = (1 << len(names)) - 1
+
+    # ---- 作业内增量更新（只触及回执所涉文件）----
+
+    def disable_copy(self, file: str, volume: int, position: int) -> None:
+        """停用一个副本：仅重算该文件在各卷上的掩码贡献。"""
+        cs = self.copies_by_file.get(file)
+        if not cs:
+            return
+        remaining = [c for c in cs if not (c.volume == volume and c.position == position)]
+        if len(remaining) == len(cs):
+            return
+        self.copies_by_file[file] = remaining
+        file_bit = 1 << self.bit_of_file[file]
+        for v in self.volumes:  # 先摘掉该文件的全部贡献，再按剩余副本放回
+            self.cover[v] &= ~file_bit
+        for v in {c.volume for c in remaining}:
+            self.cover[v] |= file_bit
+        if not remaining:
+            self.present_mask &= ~file_bit
+
+    def mark_done(self, file: str) -> None:
+        """文件取回成功：从待取掩码移除（副本汇总保持不变，仍可被复用查询）。"""
+        self.pending_mask &= ~(1 << self.bit_of_file[file])
+
+    def names_from_mask(self, mask: int) -> list[str]:
+        return [self.names[i] for i in range(len(self.names)) if mask & (1 << i)]
+
+    # ---- 规划 ----
+
+    def build_plan(self, current_volume: int | None, head: int) -> Plan:
+        """按当前待取掩码与带头位置生成最优读取计划。"""
+        present = self.pending_mask & self.present_mask
+        unretrievable = sorted(
+            self.names_from_mask(self.pending_mask & ~self.present_mask)
+        )
+        if present == 0:
+            return Plan([], [], 0, 0, unretrievable)
+
+        # 仅保留与待取文件有关的卷，按卷号升序分配子集位号（与历史行为一致）
+        rel_volumes = [v for v in self.volumes if self.cover[v] & present]
+        n = len(rel_volumes)
+        bit_of_volume = {v: i for i, v in enumerate(rel_volumes)}
+        rel_cover = [self.cover[v] & present for v in rel_volumes]
+
+        # 子集覆盖并集：LSB 递推，全部子集 O(2^V)
+        size = 1 << n
+        union = [0] * size
+        for mask in range(1, size):
+            lsb = mask & -mask
+            union[mask] = union[mask ^ lsb] | rel_cover[lsb.bit_length() - 1]
+
+        # “免回卷并集”：当前卷只贡献带头之后（含当前位置）的副本，
+        # 其余卷的贡献与普通并集相同。某文件被选中卷覆盖却不在免回卷并集中，
+        # 当且仅当它在选中卷内的副本全部落在当前卷且全部低于带头——必须回卷。
+        current_bit = (
+            bit_of_volume[current_volume]
+            if current_volume is not None and current_volume in bit_of_volume
+            else None
+        )
+        safe_cover = list(rel_cover)
+        if current_bit is not None:
+            after_head = 0
+            remaining = present
+            while remaining:
+                lsb = remaining & -remaining
+                remaining ^= lsb
+                f = self.names[lsb.bit_length() - 1]
+                if any(
+                    c.volume == current_volume and c.position >= head
+                    for c in self.copies_by_file[f]
                 ):
-                    rewinds = 1
-                    break
-        key = (mounts + rewinds, mounts, len(selected), mask)
-        if best_key is None or key < best_key:
-            best_key = key
-            best_mask = mask
-    return best_mask
+                    after_head |= lsb
+            safe_cover[current_bit] = after_head
+        safe_union = [0] * size
+        for mask in range(1, size):
+            lsb = mask & -mask
+            safe_union[mask] = safe_union[mask ^ lsb] | safe_cover[lsb.bit_length() - 1]
+
+        # 枚举全部非空子集并评分：覆盖检查与回卷判定均为 O(1) 位运算
+        best_key: tuple[int, int, int, int] | None = None
+        best_mask = 0
+        for mask in range(1, size):
+            if union[mask] != present:
+                continue
+            used = mask.bit_count()
+            has_current = current_bit is not None and bool(mask & (1 << current_bit))
+            mounts = used - (1 if has_current else 0)
+            rewinds = 1 if has_current and safe_union[mask] != present else 0
+            key = (mounts + rewinds, mounts, used, mask)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_mask = mask
+
+        selected = {
+            rel_volumes[i] for i in range(n) if best_mask & (1 << i)
+        }
+
+        # 待取且有副本的文件，按文件清单顺序指派副本
+        targets = [
+            self.names[i]
+            for i in range(len(self.names))
+            if present & (1 << i)
+        ]
+        by_volume: dict[int, list[Copy]] = {}
+        for f in targets:
+            chosen = _assign(
+                f, self.copies_by_file, selected, current_volume, head
+            )
+            by_volume.setdefault(chosen.volume, []).append(chosen)
+
+        # 当前卷最先读（避免卸下再装），其余卷按卷号升序
+        ordered = sorted(by_volume, key=lambda v: (v != current_volume, v))
+
+        steps: list[Step] = []
+        seq = 1
+
+        def emit(action: str, **kw) -> None:
+            nonlocal seq
+            steps.append(Step(seq=seq, action=action, **kw))
+            seq += 1
+
+        for volume in ordered:
+            items = sorted(by_volume[volume], key=lambda c: (c.position, c.file))
+            if volume == current_volume:
+                after = [c for c in items if c.position >= head]
+                before = [c for c in items if c.position < head]
+                for c in after:
+                    emit("read", volume=volume, file=c.file, position=c.position)
+                if before:
+                    emit("rewind", volume=volume)
+                    for c in before:
+                        emit("read", volume=volume, file=c.file, position=c.position)
+            else:
+                emit("mount", volume=volume)
+                for c in items:
+                    emit("read", volume=volume, file=c.file, position=c.position)
+
+        mounts = sum(1 for s in steps if s.action == "mount")
+        rewinds = sum(1 for s in steps if s.action == "rewind")
+        return Plan(steps, ordered, mounts, rewinds, unretrievable)
 
 
 def _assign(
@@ -121,54 +273,12 @@ def build_plan(
     current_volume: int | None,
     head: int,
 ) -> Plan:
-    """按当前状态为剩余待取文件生成最优读取计划。
+    """按当前状态为剩余待取文件生成最优读取计划（无状态入口，便于单测）。
 
     pending: 待取文件名列表。
     copies: 每个文件当前可用（未停用）的副本列表。
     current_volume: 当前已挂载的卷号（未挂载为 None）。
     head: 带头当前所在的卷内序号。
     """
-    unretrievable = sorted(f for f in pending if not copies.get(f))
-    targets = [f for f in pending if copies.get(f)]
-    if not targets:
-        return Plan([], [], 0, 0, unretrievable)
-
-    volumes = sorted({c.volume for f in targets for c in copies[f]})
-    mask = _choose_volumes(targets, copies, current_volume, head, volumes)
-    selected = {volumes[i] for i in range(len(volumes)) if mask & (1 << i)}
-
-    by_volume: dict[int, list[Copy]] = {}
-    for f in targets:
-        chosen = _assign(f, copies, selected, current_volume, head)
-        by_volume.setdefault(chosen.volume, []).append(chosen)
-
-    # 当前卷最先读（避免卸下再装），其余卷按卷号升序
-    ordered = sorted(by_volume, key=lambda v: (v != current_volume, v))
-
-    steps: list[Step] = []
-    seq = 1
-
-    def emit(action: str, **kw) -> None:
-        nonlocal seq
-        steps.append(Step(seq=seq, action=action, **kw))
-        seq += 1
-
-    for volume in ordered:
-        items = sorted(by_volume[volume], key=lambda c: (c.position, c.file))
-        if volume == current_volume:
-            after = [c for c in items if c.position >= head]
-            before = [c for c in items if c.position < head]
-            for c in after:
-                emit("read", volume=volume, file=c.file, position=c.position)
-            if before:
-                emit("rewind", volume=volume)
-                for c in before:
-                    emit("read", volume=volume, file=c.file, position=c.position)
-        else:
-            emit("mount", volume=volume)
-            for c in items:
-                emit("read", volume=volume, file=c.file, position=c.position)
-
-    mounts = sum(1 for s in steps if s.action == "mount")
-    rewinds = sum(1 for s in steps if s.action == "rewind")
-    return Plan(steps, ordered, mounts, rewinds, unretrievable)
+    index = CopyIndex(copies, all_files=pending)
+    return index.build_plan(current_volume, head)

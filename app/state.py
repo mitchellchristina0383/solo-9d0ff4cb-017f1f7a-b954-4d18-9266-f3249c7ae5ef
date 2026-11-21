@@ -6,17 +6,21 @@
 - 无论读带成功还是失败，带头都推进到该步骤的卷内序号；
   若该步骤在另一卷上，说明装带已发生，当前卷随之切换。
 - 失败的副本立即停用，不再参与后续规划。
+
+性能：作业持有一个 ``CopyIndex``，创建时一次性汇总副本目录并在各次
+重排之间复用；每张有效回执只更新所涉单个文件的掩码（成功移出待取掩码，
+失败摘掉该副本在对应卷上的贡献），不重建整份索引。
 """
 from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
 
-from .planner import Copy, Plan, Step, build_plan
+from .planner import Copy, CopyIndex, Plan, Step
 
 
 class NoJobError(Exception):
-    """尚未创建取回作业。"""
+    """尚未创建作业。"""
 
 
 class NoPendingStepError(Exception):
@@ -60,23 +64,37 @@ class Job:
     reads_ok: int = 0
     reads_failed: int = 0
     history: list[ReceiptEvent] = field(default_factory=list)
+    index: CopyIndex | None = None
+
+    def __post_init__(self) -> None:
+        if self.index is None:
+            grouped: dict[str, list[Copy]] = {}
+            for c in self.copies:
+                if c.enabled:
+                    grouped.setdefault(c.file, []).append(
+                        Copy(c.file, c.volume, c.position)
+                    )
+            # 索引按文件清单顺序分配文件位号；目录中无副本的文件同样登记
+            self.index = CopyIndex(grouped, all_files=self.files)
 
     def enabled_copies(self) -> dict[str, list[Copy]]:
-        result: dict[str, list[Copy]] = {}
-        for c in self.copies:
-            if c.enabled:
-                result.setdefault(c.file, []).append(Copy(c.file, c.volume, c.position))
-        return result
+        assert self.index is not None
+        return self.index.copies_by_file
 
     def pending(self) -> list[str]:
         return [f for f in self.files if f not in self.done]
 
     def unretrievable(self) -> list[str]:
-        enabled = self.enabled_copies()
-        return sorted(f for f in self.pending() if not enabled.get(f))
+        assert self.index is not None
+        return sorted(
+            self.index.names_from_mask(
+                self.index.pending_mask & ~self.index.present_mask
+            )
+        )
 
     def plan(self) -> Plan:
-        return build_plan(self.pending(), self.enabled_copies(), self.current_volume, self.head)
+        assert self.index is not None
+        return self.index.build_plan(self.current_volume, self.head)
 
 
 class JobStore:
@@ -109,6 +127,7 @@ class JobStore:
             if self._job is None:
                 raise NoJobError
             job = self._job
+            assert job.index is not None
             before = job.plan()
             step = before.next_read
             if step is None:
@@ -132,12 +151,15 @@ class JobStore:
             if result == "ok":
                 job.done.add(file)
                 job.reads_ok += 1
+                job.index.mark_done(file)  # 仅更新该文件的待取掩码
             else:
                 for c in job.copies:
                     if c.file == file and c.volume == volume and c.position == position:
                         c.enabled = False  # 停用出错的副本
                         break
                 job.reads_failed += 1
+                # 仅重算所涉文件在各卷上的掩码贡献，其余索引原样复用
+                job.index.disable_copy(file, volume, position)
 
             job.history.append(
                 ReceiptEvent(
